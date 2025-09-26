@@ -53,6 +53,9 @@ class ExternalReviewAgent:
         Args:
             config_path (Optional[str]): Caminho para arquivo de configuração
         """
+        # Inicializar logger da instância
+        self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
+        
         self.config = self._load_config(config_path)
 
         # Initialize all analysis services
