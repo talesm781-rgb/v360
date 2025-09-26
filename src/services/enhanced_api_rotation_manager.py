@@ -79,6 +79,9 @@ class EnhancedAPIRotationManager:
             'apify': []  # Adicionado Apify
         }
         
+        # Propriedade providers para compatibilidade
+        self._providers = {}
+        
         # Definir cadeias de fallback (cada grupo é uma prioridade)
         self.fallback_chains = {
             'ai_models': [['qwen'], ['gemini'], ['openai'], ['groq'], ['deepseek']],
@@ -637,6 +640,287 @@ class EnhancedAPIRotationManager:
                     api.status = APIStatus.ACTIVE
         
         logger.info(f"✅ Erros resetados para: {', '.join(services_to_reset)}")
+    
+    @property
+    def providers(self) -> Dict[str, Any]:
+        """
+        Propriedade providers para compatibilidade com código legado
+        Mapeia APIs para formato esperado pelo código antigo
+        """
+        if not self._providers:
+            self._providers = {}
+            for service, apis in self.apis.items():
+                for api in apis:
+                    self._providers[api.name] = {
+                        'available': api.status == APIStatus.ACTIVE,
+                        'service': service,
+                        'api_key': api.api_key,
+                        'base_url': api.base_url,
+                        'status': api.status.value,
+                        'error_count': api.error_count
+                    }
+        return self._providers
+    
+    @providers.setter
+    def providers(self, value: Dict[str, Any]):
+        """Setter para propriedade providers"""
+        self._providers = value
+        # Sincronizar com estrutura interna
+        for provider_name, provider_data in value.items():
+            service = provider_data.get('service')
+            if service and service in self.apis:
+                for api in self.apis[service]:
+                    if api.name == provider_name:
+                        api.status = APIStatus.ACTIVE if provider_data.get('available', True) else APIStatus.ERROR
+                        break
+    
+    async def generate_text(self, prompt: str, model: str = None, **kwargs) -> str:
+        """
+        Método generate_text para compatibilidade com código legado
+        Usa rotação automática de APIs para geração de texto
+        """
+        try:
+            # Determinar tipo de serviço baseado no modelo
+            service_type = 'ai_generation'
+            if model:
+                if 'qwen' in model.lower():
+                    service_type = 'ai_generation'
+                elif 'gemini' in model.lower():
+                    service_type = 'ai_generation'
+                elif 'gpt' in model.lower():
+                    service_type = 'ai_generation'
+            
+            # Obter API com fallback automático
+            api = self.get_api_with_fallback(service_type)
+            if not api:
+                raise Exception("Nenhuma API disponível para geração de texto")
+            
+            # Fazer chamada para API
+            response = await self._make_api_call(api, prompt, model, **kwargs)
+            
+            if response:
+                logger.info(f"✅ Texto gerado com sucesso via {api.name}")
+                return response
+            else:
+                raise Exception(f"Falha na geração de texto via {api.name}")
+                
+        except Exception as e:
+            logger.error(f"❌ Erro na geração de texto: {e}")
+            # Tentar fallback se disponível
+            try:
+                fallback_api = self.get_fallback_api(service_type)
+                if fallback_api and fallback_api != api:
+                    response = await self._make_api_call(fallback_api, prompt, model, **kwargs)
+                    if response:
+                        logger.info(f"✅ Texto gerado via fallback {fallback_api.name}")
+                        return response
+            except Exception as fallback_error:
+                logger.error(f"❌ Fallback também falhou: {fallback_error}")
+            
+            # Se tudo falhar, retornar resposta estruturada básica
+            return self._generate_fallback_response(prompt)
+    
+    async def _make_api_call(self, api: APIEndpoint, prompt: str, model: str = None, **kwargs) -> str:
+        """
+        Faz chamada para API específica
+        """
+        try:
+            if 'qwen' in api.name or 'openrouter' in api.name:
+                return await self._call_openrouter_api(api, prompt, model, **kwargs)
+            elif 'gemini' in api.name:
+                return await self._call_gemini_api(api, prompt, **kwargs)
+            elif 'groq' in api.name:
+                return await self._call_groq_api(api, prompt, model, **kwargs)
+            elif 'openai' in api.name:
+                return await self._call_openai_api(api, prompt, model, **kwargs)
+            else:
+                logger.warning(f"⚠️ Tipo de API não reconhecido: {api.name}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"❌ Erro na chamada da API {api.name}: {e}")
+            # Marcar API como com erro
+            self.mark_api_error(api.name.split('_')[0], api.name, e)
+            raise e
+    
+    async def _call_openrouter_api(self, api: APIEndpoint, prompt: str, model: str = None, **kwargs) -> str:
+        """Chama API do OpenRouter"""
+        try:
+            import aiohttp
+            
+            headers = {
+                'Authorization': f'Bearer {api.api_key}',
+                'Content-Type': 'application/json',
+                'HTTP-Referer': 'https://arqv30.com',
+                'X-Title': 'ARQV30 Enhanced'
+            }
+            
+            data = {
+                'model': model or 'qwen/qwen-2.5-72b-instruct',
+                'messages': [{'role': 'user', 'content': prompt}],
+                'max_tokens': kwargs.get('max_tokens', 4000),
+                'temperature': kwargs.get('temperature', 0.7)
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{api.base_url}/chat/completions",
+                    headers=headers,
+                    json=data,
+                    timeout=aiohttp.ClientTimeout(total=30)
+                ) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        return result['choices'][0]['message']['content']
+                    else:
+                        error_text = await response.text()
+                        raise Exception(f"OpenRouter API error {response.status}: {error_text}")
+                        
+        except Exception as e:
+            logger.error(f"❌ Erro na chamada OpenRouter: {e}")
+            raise e
+    
+    async def _call_gemini_api(self, api: APIEndpoint, prompt: str, **kwargs) -> str:
+        """Chama API do Gemini"""
+        try:
+            import aiohttp
+            
+            url = f"{api.base_url}/models/gemini-2.0-flash-exp:generateContent?key={api.api_key}"
+            
+            data = {
+                'contents': [{
+                    'parts': [{'text': prompt}]
+                }],
+                'generationConfig': {
+                    'maxOutputTokens': kwargs.get('max_tokens', 4000),
+                    'temperature': kwargs.get('temperature', 0.7)
+                }
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url,
+                    json=data,
+                    timeout=aiohttp.ClientTimeout(total=30)
+                ) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        return result['candidates'][0]['content']['parts'][0]['text']
+                    else:
+                        error_text = await response.text()
+                        raise Exception(f"Gemini API error {response.status}: {error_text}")
+                        
+        except Exception as e:
+            logger.error(f"❌ Erro na chamada Gemini: {e}")
+            raise e
+    
+    async def _call_groq_api(self, api: APIEndpoint, prompt: str, model: str = None, **kwargs) -> str:
+        """Chama API do Groq"""
+        try:
+            import aiohttp
+            
+            headers = {
+                'Authorization': f'Bearer {api.api_key}',
+                'Content-Type': 'application/json'
+            }
+            
+            data = {
+                'model': model or 'llama-3.1-70b-versatile',
+                'messages': [{'role': 'user', 'content': prompt}],
+                'max_tokens': kwargs.get('max_tokens', 4000),
+                'temperature': kwargs.get('temperature', 0.7)
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{api.base_url}/chat/completions",
+                    headers=headers,
+                    json=data,
+                    timeout=aiohttp.ClientTimeout(total=30)
+                ) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        return result['choices'][0]['message']['content']
+                    else:
+                        error_text = await response.text()
+                        raise Exception(f"Groq API error {response.status}: {error_text}")
+                        
+        except Exception as e:
+            logger.error(f"❌ Erro na chamada Groq: {e}")
+            raise e
+    
+    async def _call_openai_api(self, api: APIEndpoint, prompt: str, model: str = None, **kwargs) -> str:
+        """Chama API do OpenAI"""
+        try:
+            import aiohttp
+            
+            headers = {
+                'Authorization': f'Bearer {api.api_key}',
+                'Content-Type': 'application/json'
+            }
+            
+            data = {
+                'model': model or 'gpt-3.5-turbo',
+                'messages': [{'role': 'user', 'content': prompt}],
+                'max_tokens': kwargs.get('max_tokens', 4000),
+                'temperature': kwargs.get('temperature', 0.7)
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{api.base_url}/chat/completions",
+                    headers=headers,
+                    json=data,
+                    timeout=aiohttp.ClientTimeout(total=30)
+                ) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        return result['choices'][0]['message']['content']
+                    else:
+                        error_text = await response.text()
+                        raise Exception(f"OpenAI API error {response.status}: {error_text}")
+                        
+        except Exception as e:
+            logger.error(f"❌ Erro na chamada OpenAI: {e}")
+            raise e
+    
+    def _generate_fallback_response(self, prompt: str) -> str:
+        """
+        Gera resposta estruturada básica quando todas as APIs falham
+        """
+        logger.warning("⚠️ Gerando resposta estruturada básica - todas as APIs falharam")
+        
+        # Análise básica do prompt para gerar resposta relevante
+        if 'análise' in prompt.lower() or 'mercado' in prompt.lower():
+            return """
+            **ANÁLISE DE MERCADO - MODO OFFLINE**
+            
+            ⚠️ **AVISO**: Esta análise foi gerada em modo offline devido a indisponibilidade temporária das APIs de IA.
+            
+            **Recomendações Gerais:**
+            - Realizar pesquisa de mercado detalhada
+            - Analisar concorrência direta e indireta
+            - Identificar público-alvo específico
+            - Desenvolver proposta de valor única
+            - Testar MVP com grupo focal
+            
+            **Próximos Passos:**
+            - Aguardar reconexão das APIs para análise completa
+            - Coletar dados primários do mercado
+            - Validar hipóteses com dados reais
+            """
+        
+        return f"""
+        **RESPOSTA ESTRUTURADA BÁSICA**
+        
+        ⚠️ **AVISO**: Resposta gerada em modo offline.
+        
+        **Análise do Prompt:**
+        {prompt[:200]}...
+        
+        **Recomendação:**
+        Aguarde a reconexão das APIs para análise completa e personalizada.
+        """
 
 # Instância global
 api_rotation_manager = EnhancedAPIRotationManager()
